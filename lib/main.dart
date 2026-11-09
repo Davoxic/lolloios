@@ -73,7 +73,14 @@ class _PlayerHomePageState extends State<PlayerHomePage> {
     userAgent:
         'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
   );
-  final YoutubeExplode _yt = YoutubeExplode();
+  YoutubeExplode _yt = YoutubeExplode();
+
+  void _resetYt() {
+    try {
+      _yt.close();
+    } catch (_) {}
+    _yt = YoutubeExplode();
+  }
 
   _Page _currentPage = _Page.playlists;
   MusicPlaylist? _selectedPlaylist;
@@ -215,10 +222,13 @@ class _PlayerHomePageState extends State<PlayerHomePage> {
 
   /// Risolve lo stream audio da YouTube privilegiando MP4 / AAC per AVPlayer su iOS.
   Future<String?> _resolveAudioStreamUrl(String videoId) async {
+    final cleanId = videoId.replaceFirst('yt_', '').trim();
+    if (cleanId.isEmpty) return null;
+
     // 1. Prova con i client iOS e Android VR (evitano cipher JS e blocchi bot)
     try {
       final manifest = await _yt.videos.streamsClient.getManifest(
-        videoId,
+        cleanId,
         ytClients: [
           YoutubeApiClient.ios,
           YoutubeApiClient.androidVr,
@@ -227,11 +237,11 @@ class _PlayerHomePageState extends State<PlayerHomePage> {
 
       final audioStreams = manifest.audioOnly.toList();
       if (audioStreams.isNotEmpty) {
-        final mp4Streams = audioStreams.where(
-          (s) =>
-              s.container.name.toLowerCase().contains('mp4') ||
-              s.audioCodec.toLowerCase().contains('mp4a'),
-        ).toList();
+        final mp4Streams = audioStreams.where((s) {
+          final container = s.container.name.toLowerCase();
+          final mime = s.codec.mimeType.toLowerCase();
+          return container.contains('mp4') || mime.contains('mp4') || mime.contains('aac');
+        }).toList();
 
         final chosen = mp4Streams.isNotEmpty
             ? mp4Streams.reduce((a, b) =>
@@ -242,20 +252,22 @@ class _PlayerHomePageState extends State<PlayerHomePage> {
       } else if (manifest.muxed.isNotEmpty) {
         return manifest.muxed.withHighestBitrate().url.toString();
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('Tentativo primario ytClients fallito ($e), provo standard...');
+    }
 
     // 2. Fallback su client web standard
     try {
       final manifest = await _yt.videos.streamsClient
-          .getManifest(videoId)
+          .getManifest(cleanId)
           .timeout(const Duration(seconds: 8));
       final audioStreams = manifest.audioOnly.toList();
       if (audioStreams.isNotEmpty) {
-        final mp4Streams = audioStreams.where(
-          (s) =>
-              s.container.name.toLowerCase().contains('mp4') ||
-              s.audioCodec.toLowerCase().contains('mp4a'),
-        ).toList();
+        final mp4Streams = audioStreams.where((s) {
+          final container = s.container.name.toLowerCase();
+          final mime = s.codec.mimeType.toLowerCase();
+          return container.contains('mp4') || mime.contains('mp4') || mime.contains('aac');
+        }).toList();
 
         final chosen = mp4Streams.isNotEmpty
             ? mp4Streams.reduce((a, b) =>
@@ -266,7 +278,24 @@ class _PlayerHomePageState extends State<PlayerHomePage> {
       } else if (manifest.muxed.isNotEmpty) {
         return manifest.muxed.withHighestBitrate().url.toString();
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('Tentativo secondario standard fallito ($e), reset client...');
+      _resetYt();
+    }
+
+    // 3. Fallback finale con client fresco senza restrizioni su container
+    try {
+      _resetYt();
+      final manifest = await _yt.videos.streamsClient.getManifest(cleanId);
+      final audioStreams = manifest.audioOnly.toList();
+      if (audioStreams.isNotEmpty) {
+        return manifest.audioOnly.withHighestBitrate().url.toString();
+      } else if (manifest.muxed.isNotEmpty) {
+        return manifest.muxed.withHighestBitrate().url.toString();
+      }
+    } catch (e) {
+      debugPrint('Tentativo terziario finale fallito: $e');
+    }
 
     return null;
   }
