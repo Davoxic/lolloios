@@ -1,0 +1,93 @@
+name: Build IPA (unsigned)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build unsigned .ipa
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Toolchain Info
+        run: |
+          flutter --version
+          xcodebuild -version
+          sw_vers
+
+      - name: Bootstrap iOS platform files
+        run: |
+          cp -R lib lib_bak
+          cp pubspec.yaml pubspec.yaml.bak
+          flutter create . --org com.dchietti --project-name lolloios --platforms ios
+          rm -rf lib test
+          mv lib_bak lib
+          mv pubspec.yaml.bak pubspec.yaml
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Configure iOS project (background audio & unsigned settings)
+        run: python3 scripts/configure_ios.py
+
+      - name: Build iOS (Release, no code signing)
+        run: |
+          set -o pipefail
+          export LANG=en_US.UTF-8
+          flutter build ios --release --no-codesign 2>&1 | tee build.log || {
+            echo "::error::Build failed! Ultimi log:"
+            tail -n 80 build.log
+            echo "### Flutter Build Failure Log" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 100 build.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          }
+
+      - name: Package into .ipa
+        run: |
+          set -euo pipefail
+          APP_PATH="build/ios/iphoneos/Runner.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::Runner.app non trovata in $APP_PATH"
+            find build -name "*.app" -maxdepth 6 -print || true
+            exit 1
+          fi
+          rm -rf Payload lolloios-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/Lollo.app
+          rm -rf "Payload/Lollo.app/_CodeSignature" "Payload/Lollo.app/embedded.mobileprovision"
+          zip -qry lolloios-unsigned.ipa Payload
+          ls -lh lolloios-unsigned.ipa
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lolloios-unsigned-ipa
+          path: lolloios-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-build-log
+          path: build.log
+          if-no-files-found: ignore
