@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
@@ -69,10 +71,7 @@ class PlayerHomePage extends StatefulWidget {
 
 class _PlayerHomePageState extends State<PlayerHomePage> {
   final MusicLibrary _library = MusicLibrary();
-  final AudioPlayer _player = AudioPlayer(
-    userAgent:
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
-  );
+  final AudioPlayer _player = AudioPlayer();
   YoutubeExplode _yt = YoutubeExplode();
 
   void _resetYt() {
@@ -95,12 +94,6 @@ class _PlayerHomePageState extends State<PlayerHomePage> {
   Duration _duration = Duration.zero;
   bool _isPlaying = false;
   bool _isShuffle = false;
-
-  final Map<String, String> _customHeaders = {
-    'User-Agent':
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
-    'Referer': 'https://www.youtube.com/',
-  };
 
   @override
   void initState() {
@@ -220,12 +213,43 @@ class _PlayerHomePageState extends State<PlayerHomePage> {
     return MusicTrack.fromVideo(video);
   }
 
-  /// Risolve lo stream audio da YouTube privilegiando MP4 / AAC per AVPlayer su iOS.
+  /// Risolve lo stream audio rigorosamente in formato MP4 / AAC per Apple AVPlayer su iOS.
+  /// AVPlayer NON supporta WebM/Opus, quindi se audioOnly ha solo WebM, ricorre al flusso MP4 muxed.
   Future<String?> _resolveAudioStreamUrl(String videoId) async {
     final cleanId = videoId.replaceFirst('yt_', '').trim();
     if (cleanId.isEmpty) return null;
 
-    // 1. Prova con i client iOS e Android VR (evitano cipher JS e blocchi bot)
+    // Helper per estrarre lo stream MP4/AAC con il bitrate più alto
+    String? pickMp4Stream(StreamManifest manifest) {
+      // 1. Cerca prima in audioOnly stream con codec AAC/MP4
+      final mp4Audio = manifest.audioOnly.where((s) {
+        final container = s.container.name.toLowerCase();
+        final mime = s.codec.mimeType.toLowerCase();
+        return container.contains('mp4') ||
+            mime.contains('mp4') ||
+            mime.contains('aac') ||
+            mime.contains('m4a');
+      }).toList();
+
+      if (mp4Audio.isNotEmpty) {
+        return mp4Audio.withHighestBitrate().url.toString();
+      }
+
+      // 2. Se in audioOnly ci sono solo stream WebM/Opus (incompatibili con iOS AVPlayer),
+      // usiamo il flusso MP4 muxed (video+audio AAC), da cui AVPlayer suona l'audio nativamente!
+      final mp4Muxed = manifest.muxed.where((s) {
+        final container = s.container.name.toLowerCase();
+        return container.contains('mp4');
+      }).toList();
+
+      if (mp4Muxed.isNotEmpty) {
+        return mp4Muxed.withHighestBitrate().url.toString();
+      }
+
+      return null;
+    }
+
+    // Tentativo 1: con ytClients iOS e AndroidVR
     try {
       final manifest = await _yt.videos.streamsClient.getManifest(
         cleanId,
@@ -235,69 +259,51 @@ class _PlayerHomePageState extends State<PlayerHomePage> {
         ],
       ).timeout(const Duration(seconds: 10));
 
-      final audioStreams = manifest.audioOnly.toList();
-      if (audioStreams.isNotEmpty) {
-        final mp4Streams = audioStreams.where((s) {
-          final container = s.container.name.toLowerCase();
-          final mime = s.codec.mimeType.toLowerCase();
-          return container.contains('mp4') || mime.contains('mp4') || mime.contains('aac');
-        }).toList();
-
-        final chosen = mp4Streams.isNotEmpty
-            ? mp4Streams.reduce((a, b) =>
-                a.bitrate.bitsPerSecond > b.bitrate.bitsPerSecond ? a : b)
-            : audioStreams.reduce((a, b) =>
-                a.bitrate.bitsPerSecond > b.bitrate.bitsPerSecond ? a : b);
-        return chosen.url.toString();
-      } else if (manifest.muxed.isNotEmpty) {
-        return manifest.muxed.withHighestBitrate().url.toString();
-      }
+      final url = pickMp4Stream(manifest);
+      if (url != null) return url;
     } catch (e) {
       debugPrint('Tentativo primario ytClients fallito ($e), provo standard...');
     }
 
-    // 2. Fallback su client web standard
+    // Tentativo 2: getManifest standard
     try {
       final manifest = await _yt.videos.streamsClient
           .getManifest(cleanId)
           .timeout(const Duration(seconds: 8));
-      final audioStreams = manifest.audioOnly.toList();
-      if (audioStreams.isNotEmpty) {
-        final mp4Streams = audioStreams.where((s) {
-          final container = s.container.name.toLowerCase();
-          final mime = s.codec.mimeType.toLowerCase();
-          return container.contains('mp4') || mime.contains('mp4') || mime.contains('aac');
-        }).toList();
 
-        final chosen = mp4Streams.isNotEmpty
-            ? mp4Streams.reduce((a, b) =>
-                a.bitrate.bitsPerSecond > b.bitrate.bitsPerSecond ? a : b)
-            : audioStreams.reduce((a, b) =>
-                a.bitrate.bitsPerSecond > b.bitrate.bitsPerSecond ? a : b);
-        return chosen.url.toString();
-      } else if (manifest.muxed.isNotEmpty) {
-        return manifest.muxed.withHighestBitrate().url.toString();
-      }
+      final url = pickMp4Stream(manifest);
+      if (url != null) return url;
     } catch (e) {
       debugPrint('Tentativo secondario standard fallito ($e), reset client...');
       _resetYt();
     }
 
-    // 3. Fallback finale con client fresco senza restrizioni su container
+    // Tentativo 3: client fresco
     try {
       _resetYt();
       final manifest = await _yt.videos.streamsClient.getManifest(cleanId);
-      final audioStreams = manifest.audioOnly.toList();
-      if (audioStreams.isNotEmpty) {
-        return manifest.audioOnly.withHighestBitrate().url.toString();
-      } else if (manifest.muxed.isNotEmpty) {
-        return manifest.muxed.withHighestBitrate().url.toString();
-      }
+      final url = pickMp4Stream(manifest);
+      if (url != null) return url;
     } catch (e) {
       debugPrint('Tentativo terziario finale fallito: $e');
     }
 
     return null;
+  }
+
+  /// Crea una sorgente audio adatta a iOS: usa la cache locale se presente o l'URL diretto senza headers
+  Future<AudioSource> _createAudioSource(
+    String videoId,
+    String streamUrl,
+    MediaItem mediaItem,
+  ) async {
+    final cleanId = videoId.replaceFirst('yt_', '').trim();
+    final cacheFile = File('${Directory.systemTemp.path}/$cleanId.m4a');
+    if (await cacheFile.exists() && await cacheFile.length() > 50000) {
+      return AudioSource.file(cacheFile.path, tag: mediaItem);
+    }
+    // Niente headers per evitare che just_audio crei un server proxy localhost su iOS
+    return AudioSource.uri(Uri.parse(streamUrl), tag: mediaItem);
   }
 
   Future<void> _playSingleTrack(MusicTrack track) async {
@@ -326,33 +332,66 @@ class _PlayerHomePageState extends State<PlayerHomePage> {
       album: 'Lollo',
       title: track.title,
       artist: track.artist,
-      artUri: track.thumbnailUrl.isNotEmpty ? Uri.tryParse(track.thumbnailUrl) : null,
+      artUri: track.thumbnailUrl.isNotEmpty
+          ? Uri.tryParse(track.thumbnailUrl)
+          : null,
       duration: track.duration > Duration.zero ? track.duration : null,
     );
 
-    final source = AudioSource.uri(
-      Uri.parse(streamUrl),
-      headers: _customHeaders,
-      tag: mediaItem,
-    );
-
     try {
+      final source = await _createAudioSource(track.id, streamUrl, mediaItem);
       await _player.setAudioSource(source);
       await _player.play();
-      if (mounted) {
+    } catch (e) {
+      debugPrint('Errore streaming diretto ($e), provo download e cache locale per iOS...');
+      try {
         messenger.showSnackBar(
           SnackBar(
-            content: Text('Avviata la riproduzione: ${track.title}'),
-            duration: const Duration(seconds: 2),
+            content: Text('Caricamento rapido ${track.title}...'),
+            duration: const Duration(seconds: 3),
           ),
         );
+
+        final cleanId = track.id.replaceFirst('yt_', '').trim();
+        final cacheFile = File('${Directory.systemTemp.path}/$cleanId.m4a');
+        final client = http.Client();
+        try {
+          final req = http.Request('GET', Uri.parse(streamUrl));
+          req.headers['User-Agent'] =
+              'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15';
+          final resp = await client.send(req);
+          final sink = cacheFile.openWrite();
+          await resp.stream.pipe(sink);
+          await sink.flush();
+          await sink.close();
+        } finally {
+          client.close();
+        }
+
+        if (await cacheFile.exists() && await cacheFile.length() > 50000) {
+          final fileSource = AudioSource.file(cacheFile.path, tag: mediaItem);
+          await _player.setAudioSource(fileSource);
+          await _player.play();
+        } else {
+          throw Exception('File audio non riproducibile');
+        }
+      } catch (inner) {
+        if (mounted) {
+          messenger.showSnackBar(
+            SnackBar(content: Text('Errore del player: $inner')),
+          );
+        }
+        return;
       }
-    } catch (e) {
-      if (mounted) {
-        messenger.showSnackBar(
-          SnackBar(content: Text('Errore del player: $e')),
-        );
-      }
+    }
+
+    if (mounted) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('Avviata la riproduzione: ${track.title}'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
     }
   }
 
@@ -390,22 +429,19 @@ class _PlayerHomePageState extends State<PlayerHomePage> {
         if (i == initialIndex) {
           targetIndex = audioSources.length;
         }
-        audioSources.add(
-          AudioSource.uri(
-            Uri.parse(streamUrl),
-            headers: _customHeaders,
-            tag: MediaItem(
-              id: t.id,
-              album: playlist.name,
-              title: t.title,
-              artist: t.artist,
-              artUri: t.thumbnailUrl.isNotEmpty
-                  ? Uri.tryParse(t.thumbnailUrl)
-                  : null,
-              duration: t.duration > Duration.zero ? t.duration : null,
-            ),
-          ),
+        final mediaItem = MediaItem(
+          id: t.id,
+          album: playlist.name,
+          title: t.title,
+          artist: t.artist,
+          artUri: t.thumbnailUrl.isNotEmpty
+              ? Uri.tryParse(t.thumbnailUrl)
+              : null,
+          duration: t.duration > Duration.zero ? t.duration : null,
         );
+
+        final source = await _createAudioSource(t.id, streamUrl, mediaItem);
+        audioSources.add(source);
         readyCount++;
       } else {
         debugPrint('${t.title}: nessuno stream audio disponibile');

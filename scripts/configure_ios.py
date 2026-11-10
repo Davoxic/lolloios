@@ -35,6 +35,7 @@ def configure_info_plist():
     # App Transport Security per stream audio da CDN YouTube
     ats = plist.get("NSAppTransportSecurity", {})
     ats["NSAllowsArbitraryLoads"] = True
+    ats["NSAllowsLocalNetworking"] = True
     plist["NSAppTransportSecurity"] = ats
 
     with open(INFO_PLIST, "wb") as f:
